@@ -20,13 +20,16 @@ That's it! The installer will:
 ## 📦 What Gets Installed
 
 ```
-%LOCALAPPDATA%\Enginuity Labs\Enginuity Design Studio\
+%LOCALAPPDATA%\Enginuity Labs\Enginuity Design Studio\   (the application)
   eds_app.exe          the application
   runtime\ccx\         CalculiX solver and its runtime libraries
   runtime\gmsh\        Gmsh meshing library
   VERSION.txt          the installed release version
   install.json         installation marker, read by the in-app updater
-  logs\                application logs (preserved across updates)
+
+%LOCALAPPDATA%\Enginuity Labs\Design Studio\data\        (your data, kept across updates)
+  logs\eds_app.log     application log
+  update\              staged installers and their transcripts
 ```
 
 Meshing and simulation run **locally** against the bundled Gmsh and CalculiX. The
@@ -61,6 +64,9 @@ irm https://raw.githubusercontent.com/Enginuity-Labs/Enginuity-Design-Studio/mai
 ```
 
 ## 🗑️ Uninstall
+
+Uninstalling also removes your saved sign-in from Windows Credential Manager
+and deletes the application's local data. Updating never does.
 
 **Method 1:** Windows Settings
 - Settings → Apps → Enginuity Design Studio → Uninstall
@@ -106,7 +112,7 @@ irm https://raw.githubusercontent.com/Enginuity-Labs/Enginuity-Design-Studio/mai
 `-Silent`, `-WaitForPid`, and `-Launch` exist for the in-app updater, which hands
 off to this script and then quits so its own executable can be replaced. A silent
 run writes a transcript to
-`%LOCALAPPDATA%\Enginuity Labs\Design Studio\update\install-<tag>.log`.
+`%LOCALAPPDATA%\Enginuity Labs\Design Studio\data\update\install-<tag>.log`.
 
 ### Exit Codes
 
@@ -126,8 +132,9 @@ run writes a transcript to
 1. Check your internet connection
 2. Verify you're not installing to Program Files
 3. Close any running Enginuity Design Studio windows
-4. For a silent run, read the transcript under
-   `%LOCALAPPDATA%\Enginuity Labs\Design Studio\update\`
+4. Read the application log at
+   `%LOCALAPPDATA%\Enginuity Labs\Design Studio\data\logs\eds_app.log`,
+   and for a silent run the installer transcript beside it under `...\data\update\`
 5. Check [Issues](https://github.com/Enginuity-Labs/Enginuity-Design-Studio/issues)
 
 ### The In-App Updater Never Offers Anything

@@ -6,11 +6,10 @@
     Downloads and installs Enginuity Design Studio from the public repository's
     GitHub releases.
 
-    This file is the canonical copy. It is version-controlled beside the
-    application whose payload it installs, published as an asset on every
-    release by code/builds/deploy.ps1, and mirrored to the public repository so
-    that `irm ... | iex` can reach it for a first install. deploy.ps1 compares
-    the two at publish time and complains when they have drifted.
+    This repository holds the only copy. The application's own repository fetches
+    it from here at publish time and attaches it to each release, so an installed
+    application updates with the installer that shipped alongside the version it
+    is installing, while `irm ... | iex` always reaches whatever is on main.
 
     The published package is a single application and its solver runtime:
 
@@ -536,7 +535,6 @@ function Install-Enginuity {
 
         Write-Step "Installing files..."
         New-Item -ItemType Directory -Path $InstallPath -Force | Out-Null
-        New-Item -ItemType Directory -Path (Join-Path $InstallPath "logs") -Force | Out-Null
 
         # Mirrored rather than copied, so a library dropped from a later release
         # actually goes away instead of lingering and being loaded. logs and
@@ -714,6 +712,48 @@ function New-InstallMarker {
 
 # -- Uninstall ------------------------------------------------------------
 
+# Removes the saved sign-in and the application's own local data.
+#
+# Delegated to the application rather than done here. The saved session lives in
+# Windows Credential Manager under names this script would have to reproduce --
+# including a chunking scheme for secrets too large for one credential -- and the
+# preferences are encrypted with a key held in the same store. Guessing at any of
+# that from PowerShell would appear to work and quietly leave the credential
+# behind the day the format changed. The application owns the format, so it owns
+# the deletion.
+#
+# Run before the files are removed, because the executable is what performs it,
+# and only on uninstall: an update must never sign the user out.
+#
+# Failure is reported and then tolerated. A leftover credential is a privacy
+# annoyance; refusing to uninstall over it would be worse.
+function Remove-UserData {
+    Write-Step "Removing saved sign-in and local data..."
+
+    $exe = Join-Path $InstallPath $EXECUTABLE
+    if (-not (Test-Path $exe)) {
+        Write-ColorOutput "  $EXECUTABLE is already gone; skipping." "Yellow"
+        return
+    }
+
+    # Start-Process -Wait rather than the call operator. A release build declares
+    # the Windows GUI subsystem, and PowerShell does not wait for a GUI process
+    # invoked with `&` -- it would return immediately, leave $LASTEXITCODE
+    # meaningless, and let the file removal below race the purge it just started.
+    try {
+        $process = Start-Process -FilePath $exe -ArgumentList "--purge-user-data" `
+            -Wait -PassThru -NoNewWindow -ErrorAction Stop
+        if ($process.ExitCode -eq 0) {
+            Write-Success "Saved sign-in and local data removed"
+        } else {
+            Write-ColorOutput "  Some local data could not be removed (exit $($process.ExitCode))." "Yellow"
+            Write-ColorOutput "  Sign out from the application before uninstalling to clear it." "Gray"
+        }
+    } catch {
+        Write-ColorOutput "  Could not remove saved sign-in: $($_.Exception.Message)" "Yellow"
+    }
+}
+
 function Uninstall-Enginuity {
     Show-Banner
 
@@ -735,15 +775,14 @@ function Uninstall-Enginuity {
             return $EXIT_PROCESS_STUCK
         }
 
+        Remove-UserData
+
         Write-Step "Removing application files..."
         foreach ($item in @("runtime", $EXECUTABLE, "VERSION.txt", "README.txt", "install.json", "uninstall.ps1")) {
             Remove-Item -Path (Join-Path $InstallPath $item) -Recurse -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -Path (Join-Path $InstallPath "update") -Recurse -Force -ErrorAction SilentlyContinue
 
-        if ((Read-Answer -Prompt "Remove log files as well? (y/N)" -Default "n") -match '^[Yy]$') {
-            Remove-Item -Path (Join-Path $InstallPath "logs") -Recurse -Force -ErrorAction SilentlyContinue
-        }
         Write-Success "Files removed"
 
         Write-Step "Removing shortcuts..."
@@ -777,7 +816,10 @@ function Uninstall-Enginuity {
 $transcriptStarted = $false
 if ($Silent) {
     try {
-        $logDirectory = Join-Path $env:LOCALAPPDATA "Enginuity Labs\Design Studio\update"
+        # The same directory the application stages installers into, so a support
+        # request names one location: the staged script, its transcript, and the
+        # application log all live under ...\Design Studio\data\.
+        $logDirectory = Join-Path $env:LOCALAPPDATA "Enginuity Labs\Design Studio\data\update"
         New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
         $safeTag = ($Version -replace '[^A-Za-z0-9._-]', '_')
         Start-Transcript -Path (Join-Path $logDirectory "install-$safeTag.log") -Force | Out-Null
