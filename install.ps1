@@ -1,37 +1,87 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Enginuity Design Studio Installer
+    Enginuity Design Studio installer.
 .DESCRIPTION
-    Downloads and installs Enginuity Design Studio from GitHub releases
+    Downloads and installs Enginuity Design Studio from the public repository's
+    GitHub releases.
+
+    This file is the canonical copy. It is version-controlled beside the
+    application whose payload it installs, published as an asset on every
+    release by code/builds/deploy.ps1, and mirrored to the public repository so
+    that `irm ... | iex` can reach it for a first install. deploy.ps1 compares
+    the two at publish time and complains when they have drifted.
+
+    The published package is a single application and its solver runtime:
+
+        eds_app.exe          the application
+        runtime\ccx\         CalculiX and its runtime libraries
+        runtime\gmsh\        the Gmsh shared library
+        VERSION.txt          the release version, as text
+        README.txt           package notes
+
 .PARAMETER Version
-    Specific version to install (default: latest)
+    A release tag such as v1.0.0.1, or "latest" (default).
 .PARAMETER InstallPath
-    Custom installation path (default: $env:LOCALAPPDATA\Enginuity Labs\Enginuity Design Studio)
+    Installation directory. Defaults to
+    $env:LOCALAPPDATA\Enginuity Labs\Enginuity Design Studio.
 .PARAMETER Action
-    Action to perform: install, update, repair, uninstall (default: menu)
+    install, update, repair, uninstall, or menu (default).
+.PARAMETER Silent
+    Never prompt. Every question takes its default, and the outcome is
+    communicated by the exit code. Required for a run the application starts,
+    where the console belongs to a process the user did not launch and a prompt
+    would be an invisible hang.
+.PARAMETER WaitForPid
+    Wait for this process to exit before touching any file. The application
+    passes its own process id here: it cannot replace its own executable, so it
+    hands off and quits, and this is what makes the ordering safe.
+.PARAMETER Launch
+    Start the application when the run succeeds.
+.PARAMETER NoLaunch
+    Never start the application, overriding -Launch.
 .EXAMPLE
-    irm https://raw.githubusercontent.com/JadeVexo/Enginuity-Design-Studio/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/Enginuity-Labs/Enginuity-Design-Studio/main/install.ps1 | iex
 .EXAMPLE
-    irm https://raw.githubusercontent.com/JadeVexo/Enginuity-Design-Studio/main/install.ps1 | iex -Action install
+    .\install.ps1 -Action update -Version v1.0.0.1
+.EXAMPLE
+    .\install.ps1 -Action update -Version v1.0.0.1 -Silent -WaitForPid 4242 -Launch
 #>
 
 param(
     [string]$Version = "latest",
     [string]$InstallPath = "$env:LOCALAPPDATA\Enginuity Labs\Enginuity Design Studio",
     [ValidateSet("menu", "install", "update", "repair", "uninstall")]
-    [string]$Action = "menu"
+    [string]$Action = "menu",
+    [switch]$Silent,
+    [int]$WaitForPid = 0,
+    [switch]$Launch,
+    [switch]$NoLaunch
 )
 
-# Configuration
 $ErrorActionPreference = "Stop"
 $ProgressPreference = 'Continue'
 
-$GITHUB_REPO = "JadeVexo/Enginuity-Design-Studio"
+# The canonical public repository. Renames leave a redirect behind, so the old
+# JadeVexo path still resolves, but relying on a redirect for the update path of
+# an installed application is not worth the saving.
+$GITHUB_REPO = "Enginuity-Labs/Enginuity-Design-Studio"
 $PRODUCT_NAME = "Enginuity Design Studio"
 $COMPANY_NAME = "Enginuity Labs"
+$EXECUTABLE = "eds_app.exe"
+$USER_AGENT = "EnginuityInstaller/2.0"
 
-# Colors for output
+# Exit codes. An unattended run is read by a program, not a person.
+$EXIT_OK = 0
+$EXIT_NO_RELEASE = 10
+$EXIT_DOWNLOAD_FAILED = 11
+$EXIT_BAD_PACKAGE = 12
+$EXIT_COPY_FAILED = 13
+$EXIT_PROCESS_STUCK = 14
+$EXIT_GENERAL = 1
+
+# -- Output ---------------------------------------------------------------
+
 function Write-ColorOutput {
     param([string]$Message, [string]$Color = "White")
     Write-Host $Message -ForegroundColor $Color
@@ -39,81 +89,170 @@ function Write-ColorOutput {
 
 function Write-Step {
     param([string]$Message)
-    Write-ColorOutput "`n▶ $Message" "Cyan"
+    Write-ColorOutput "`n> $Message" "Cyan"
 }
 
 function Write-Success {
     param([string]$Message)
-    Write-ColorOutput "✓ $Message" "Green"
+    Write-ColorOutput "  OK $Message" "Green"
 }
 
 function Write-ErrorMsg {
     param([string]$Message)
-    Write-ColorOutput "✗ $Message" "Red"
+    Write-ColorOutput "  XX $Message" "Red"
 }
 
-# Banner
+# The only way this script asks a question.
+#
+# Routed through one helper so that -Silent cannot be defeated by a prompt added
+# later: a Read-Host reached in silent mode is a hang with no visible cause,
+# because the console belongs to a process the user never started.
+function Read-Answer {
+    param([string]$Prompt, [string]$Default)
+
+    if ($Silent) {
+        Write-ColorOutput "  $Prompt -> $Default (silent)" "DarkGray"
+        return $Default
+    }
+    $answer = Read-Host "  $Prompt"
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
+    return $answer
+}
+
+# Waits for the application to exit, then makes sure of it.
+#
+# Bounded and then forced: a hung application must not leave the user with a
+# console sitting on "waiting" forever and a half-updated installation. The sweep
+# afterwards matters because the application re-executes itself as a Gmsh worker
+# and as a native-kernel worker, so those share the executable's name, and one
+# survivor holding a handle is enough to fail the copy.
+function Wait-ForHandoff {
+    if ($WaitForPid -le 0) { return $true }
+
+    Write-Step "Waiting for the application to close (pid $WaitForPid)..."
+
+    # Resolved first, and waited on through the object rather than through
+    # Wait-Process. A pid that has already gone is the *common* case -- the
+    # application quits as soon as it has handed off, so it is usually gone before
+    # this script has finished starting -- and Wait-Process signals that by
+    # throwing, which is a poor way to learn that everything is fine.
+    $process = Get-Process -Id $WaitForPid -ErrorAction SilentlyContinue
+    if (-not $process) {
+        Write-Success "Application had already closed"
+        return $true
+    }
+
+    if ($process.WaitForExit(60000)) {
+        Write-Success "Application closed"
+    } else {
+        Write-ColorOutput "  Still running after 60s; stopping it." "Yellow"
+        Stop-Process -Id $WaitForPid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    return $true
+}
+
 function Show-Banner {
-    Clear-Host
+    # Clear-Host moves the cursor through the console handle, which does not exist
+    # when the host's output is redirected -- a piped run, a CI log, an
+    # application-spawned run whose console was not allocated. Losing a
+    # decorative clear must not fail the installation.
+    try { Clear-Host } catch { }
     Write-ColorOutput @"
-╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                                                ║
-║                                                                                                                ║   
-║   ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗██╗   ██╗██╗████████╗██╗   ██╗    ██╗      █████╗ ██████╗ ███████╗   ║
-║   ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██║   ██║██║╚══██╔══╝╚██╗ ██╔╝    ██║     ██╔══██╗██╔══██╗██╔════╝   ║
-║   █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║██║   ██║██║   ██║    ╚████╔╝     ██║     ███████║██████╔╝███████╗   ║
-║   ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██║   ██║██║   ██║     ╚██╔╝      ██║     ██╔══██║██╔══██╗╚════██║   ║
-║   ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║╚██████╔╝██║   ██║      ██║       ███████╗██║  ██║██████╔╝███████║   ║
-║   ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝   ╚═╝      ╚═╝       ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝   ║
-║                                                                                                                ║
-║                                           Enginuity Design Studio                                              ║
-║                                         Agent Driven Hardware Design                                           ║
-║                                                                                                                ║
-║                                                                                                                ║
-╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝                                                                                                                                                                      
++================================================================================================================+
+|                                                                                                                |
+|   ENGINUITY LABS                                                                                               |
+|                                                                                                                |
+|   ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗██╗   ██╗██╗████████╗██╗   ██╗    ██╗      █████╗ ██████╗ ███████╗   |
+|   ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██║   ██║██║╚══██╔══╝╚██╗ ██╔╝    ██║     ██╔══██╗██╔══██╗██╔════╝   |
+|   █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║██║   ██║██║   ██║    ╚████╔╝     ██║     ███████║██████╔╝███████╗   |
+|   ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██║   ██║██║   ██║     ╚██╔╝      ██║     ██╔══██║██╔══██╗╚════██║   |
+|   ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║╚██████╔╝██║   ██║      ██║       ███████╗██║  ██║██████╔╝███████║   |
+|   ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝   ╚═╝      ╚═╝       ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝   |
+|                                                                                                                |
+|                                           Enginuity Design Studio                                              |
+|                                         Agent Driven Hardware Design                                           |
+|                                                                                                                |
++================================================================================================================+
 "@ "Cyan"
 }
 
-# Main Menu
+# -- Installation state ---------------------------------------------------
+
+function Test-Installation {
+    return (Test-Path (Join-Path $InstallPath $EXECUTABLE))
+}
+
+# The installed version, preferring the marker beside the executable.
+#
+# The marker describes the directory it sits in, so a second installation in
+# another directory reports itself correctly instead of both reading one
+# registry key. The registry is consulted only for installations that predate
+# the marker.
+function Get-InstalledVersion {
+    $markerPath = Join-Path $InstallPath "install.json"
+    if (Test-Path $markerPath) {
+        try {
+            $marker = Get-Content $markerPath -Raw | ConvertFrom-Json
+            if ($marker.version) { return $marker.version }
+        } catch { }
+    }
+
+    $versionPath = Join-Path $InstallPath "VERSION.txt"
+    if (Test-Path $versionPath) {
+        try {
+            $text = (Get-Content $versionPath -Raw).Trim()
+            if ($text) { return $text }
+        } catch { }
+    }
+
+    try {
+        $regPath = "HKCU:\Software\$COMPANY_NAME\$PRODUCT_NAME"
+        if (Test-Path $regPath) {
+            $value = Get-ItemProperty -Path $regPath -Name "Version" -ErrorAction SilentlyContinue
+            if ($value) { return $value.Version }
+        }
+    } catch { }
+
+    return "Unknown"
+}
+
+# -- Menu -----------------------------------------------------------------
+
 function Show-Menu {
     param([bool]$IsInstalled = $false)
-    
+
     Show-Banner
-    
+
     if ($IsInstalled) {
-        $installedVersion = Get-InstalledVersion
-        Write-ColorOutput "`n📦 Status: Installed (Version: $installedVersion)" "Green"
+        Write-ColorOutput "`n  Status: Installed (version $(Get-InstalledVersion))" "Green"
     } else {
-        Write-ColorOutput "`n📦 Status: Not Installed" "Yellow"
+        Write-ColorOutput "`n  Status: Not installed" "Yellow"
     }
-    
-    Write-ColorOutput "`n═══════════════════════════════════════════════════" "Gray"
-    Write-ColorOutput "  Please select an option:" "White"
-    Write-ColorOutput "═══════════════════════════════════════════════════" "Gray"
-    
+
+    Write-ColorOutput "`n===================================================" "Gray"
+    Write-ColorOutput "  Select an option:" "White"
+    Write-ColorOutput "===================================================" "Gray"
+
     if (-not $IsInstalled) {
-        Write-ColorOutput "  [1] Install Enginuity Design Studio" "Cyan"
+        Write-ColorOutput "  [1] Install $PRODUCT_NAME" "Cyan"
         Write-ColorOutput "  [2] Exit" "Gray"
     } else {
-        Write-ColorOutput "  [1] Update to Latest Version" "Cyan"
-        Write-ColorOutput "  [2] Repair Installation" "Yellow"
+        Write-ColorOutput "  [1] Update to the latest version" "Cyan"
+        Write-ColorOutput "  [2] Repair this installation" "Yellow"
         Write-ColorOutput "  [3] Uninstall" "Red"
         Write-ColorOutput "  [4] Exit" "Gray"
     }
-    
-    Write-ColorOutput "═══════════════════════════════════════════════════`n" "Gray"
-    
-    $choice = Read-Host "Enter your choice"
-    
+
+    Write-ColorOutput "===================================================`n" "Gray"
+
+    $choice = Read-Host "  Enter your choice"
+
+
     if (-not $IsInstalled) {
         switch ($choice) {
             "1" { return "install" }
             "2" { return "exit" }
-            default { 
-                Write-ColorOutput "`n⚠ Invalid choice. Please try again." "Red"
-                Start-Sleep -Seconds 2
-                return Show-Menu -IsInstalled $IsInstalled
-            }
         }
     } else {
         switch ($choice) {
@@ -121,538 +260,561 @@ function Show-Menu {
             "2" { return "repair" }
             "3" { return "uninstall" }
             "4" { return "exit" }
-            default { 
-                Write-ColorOutput "`n⚠ Invalid choice. Please try again." "Red"
-                Start-Sleep -Seconds 2
-                return Show-Menu -IsInstalled $IsInstalled
-            }
         }
     }
+
+    Write-ColorOutput "`n  Invalid choice." "Red"
+    Start-Sleep -Seconds 2
+    return (Show-Menu -IsInstalled $IsInstalled)
 }
 
-# Check if already installed
-function Test-Installation {
-    return Test-Path $InstallPath
-}
+# -- Release metadata -----------------------------------------------------
 
-# Get installed version
-function Get-InstalledVersion {
-    try {
-        $regPath = "HKCU:\Software\$COMPANY_NAME\$PRODUCT_NAME"
-        if (Test-Path $regPath) {
-            $version = Get-ItemProperty -Path $regPath -Name "Version" -ErrorAction SilentlyContinue
-            if ($version) {
-                return $version.Version
-            }
-        }
-        return "Unknown"
-    } catch {
-        return "Unknown"
+# Picks the deployment package from a release.
+#
+# Prefers the current x64 name and accepts the historical x86 one: releases
+# v0.0.0.1 and v0.0.0.2 carry the x86 spelling for what was in fact a 64-bit
+# build, and refusing them would gain nothing.
+function Select-PackageAsset {
+    param($Assets)
+
+    $zips = @($Assets | Where-Object { $_.name -like "*.zip" })
+    foreach ($pattern in @("*Deploy*Windows*x64*", "*Deploy*Windows*x86*", "*Deploy*")) {
+        $match = $zips | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+        if ($match) { return $match }
     }
+    return $null
 }
 
-# Get latest release info
 function Get-ReleaseInfo {
     param([string]$TargetVersion = "latest")
-    
+
     Write-Step "Fetching release information from GitHub..."
-    try {
-        if ($TargetVersion -eq "latest") {
-            $releaseUrl = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
-        } else {
-            $releaseUrl = "https://api.github.com/repos/$GITHUB_REPO/releases/tags/$TargetVersion"
-        }
-        
-        $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{
-            "User-Agent" = "EnginuityInstaller/1.0"
-        }
-        
-        # Look for Windows x86 deployment package first, fallback to generic Deploy
-        $asset = $release.assets | Where-Object { $_.name -like "*Deploy*Windows*x86*.zip" } | Select-Object -First 1
-        
-        if (-not $asset) {
-            # Fallback to any Deploy zip (backward compatibility)
-            $asset = $release.assets | Where-Object { $_.name -like "*Deploy*.zip" } | Select-Object -First 1
-        }
-        
-        if (-not $asset) {
-            throw "No deployment package found in release"
-        }
-        
-        Write-Success "Found version: $($release.tag_name)"
-        Write-ColorOutput "Package: $($asset.name) ($([math]::Round($asset.size / 1MB, 2)) MB)" "Gray"
-        
-        return @{
-            Version = $release.tag_name
-            DownloadUrl = $asset.browser_download_url
-            FileName = $asset.name
-            Size = $asset.size
-        }
-        
-    } catch {
-        Write-ErrorMsg "Failed to fetch release information: $_"
-        throw
+
+    if ($TargetVersion -eq "latest") {
+        $releaseUrl = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
+    } else {
+        $releaseUrl = "https://api.github.com/repos/$GITHUB_REPO/releases/tags/$TargetVersion"
+    }
+
+    $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = $USER_AGENT }
+
+    $asset = Select-PackageAsset -Assets $release.assets
+    if (-not $asset) {
+        throw "Release $($release.tag_name) has no deployment package attached."
+    }
+
+    Write-Success "Found $($release.tag_name)"
+    Write-ColorOutput "  Package: $($asset.name) ($([math]::Round($asset.size / 1MB, 2)) MB)" "Gray"
+
+    return @{
+        Version     = $release.tag_name
+        DownloadUrl = $asset.browser_download_url
+        FileName    = $asset.name
+        Size        = $asset.size
     }
 }
 
-# Download with progress bar
+# -- Download -------------------------------------------------------------
+
 function Get-FileWithProgress {
-    param(
-        [string]$Url,
-        [string]$Destination,
-        [string]$FileName
-    )
-    
+    param([string]$Url, [string]$Destination, [string]$FileName)
+
     Write-Step "Downloading $FileName..."
-    
+
+    $fileStream = $null
+    $responseStream = $null
+    $response = $null
     try {
-        # Create a custom progress handler
         $request = [System.Net.HttpWebRequest]::Create($Url)
-        $request.UserAgent = "EnginuityInstaller/1.0"
+        $request.UserAgent = $USER_AGENT
         $request.Method = "GET"
-        
+
         $response = $request.GetResponse()
         $totalBytes = $response.ContentLength
         $responseStream = $response.GetResponseStream()
-        
+
         $fileStream = [System.IO.File]::Create($Destination)
-        $buffer = New-Object byte[] 8192
+        $buffer = New-Object byte[] 81920
         $totalBytesRead = 0
-        $readCount = 0
         $lastUpdate = [DateTime]::Now
         $startTime = [DateTime]::Now
-        
+
         do {
             $readCount = $responseStream.Read($buffer, 0, $buffer.Length)
             $fileStream.Write($buffer, 0, $readCount)
             $totalBytesRead += $readCount
-            
-            # Update progress every 200ms to reduce flicker
+
+            # Repainted at most five times a second: the package is large enough
+            # that a per-buffer repaint is mostly flicker.
             $now = [DateTime]::Now
             if (($now - $lastUpdate).TotalMilliseconds -gt 200 -and $totalBytes -gt 0) {
                 $percent = [math]::Round(($totalBytesRead / $totalBytes) * 100, 1)
-                $downloadedMB = ($totalBytesRead / 1MB).ToString("F2")
-                $totalMB = ($totalBytes / 1MB).ToString("F2")
-                
-                # Calculate speed
                 $elapsed = ($now - $startTime).TotalSeconds
-                $speed = if ($elapsed -gt 0) {
-                    ($totalBytesRead / 1MB / $elapsed).ToString("F2")
-                } else { "0.00" }
-                
-                # Create progress bar (40 characters wide)
-                $barWidth = 40
-                $filledWidth = [math]::Floor($barWidth * $percent / 100)
-                $emptyWidth = $barWidth - $filledWidth
-                $bar = ("[" + ("█" * $filledWidth) + ("░" * $emptyWidth) + "]")
-                
-                # Write progress on same line
-                Write-Host "`r  $bar $percent% | $downloadedMB / $totalMB MB | $speed MB/s" -NoNewline -ForegroundColor Cyan
-                
+                $speed = if ($elapsed -gt 0) { ($totalBytesRead / 1MB / $elapsed).ToString("F2") } else { "0.00" }
+                $filled = [math]::Floor(40 * $percent / 100)
+                $bar = "[" + ("#" * $filled) + ("." * (40 - $filled)) + "]"
+                Write-Host "`r  $bar $percent% | $(($totalBytesRead / 1MB).ToString('F2')) / $(($totalBytes / 1MB).ToString('F2')) MB | $speed MB/s" -NoNewline -ForegroundColor Cyan
                 $lastUpdate = $now
             }
         } while ($readCount -gt 0)
-        
-        $fileStream.Close()
-        $responseStream.Close()
-        $response.Close()
-        
-        # Final progress bar at 100%
-        $totalMB = ($totalBytes / 1MB).ToString("F2")
+
         $elapsed = ([DateTime]::Now - $startTime).TotalSeconds
         $avgSpeed = if ($elapsed -gt 0) { ($totalBytes / 1MB / $elapsed).ToString("F2") } else { "0.00" }
-        $bar = ("[" + ("█" * 40) + "]")
-        Write-Host "`r  $bar 100% | $totalMB / $totalMB MB | $avgSpeed MB/s" -ForegroundColor Cyan
-        
-        Write-Host ""  # New line
-        Write-Success "Download completed"
-        
+        Write-Host "`r  [$("#" * 40)] 100% | $(($totalBytes / 1MB).ToString('F2')) MB | $avgSpeed MB/s" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Success "Download complete"
     } catch {
-        Write-Host ""  # New line to clear progress
-        Write-ErrorMsg "Download failed: $_"
-        
-        # Clean up partial download
-        if (Test-Path $Destination) {
-            Remove-Item $Destination -Force -ErrorAction SilentlyContinue
-        }
-        
-        throw
+        Write-Host ""
+        throw "Download failed: $($_.Exception.Message)"
+    } finally {
+        if ($fileStream) { $fileStream.Close() }
+        if ($responseStream) { $responseStream.Close() }
+        if ($response) { $response.Close() }
     }
 }
 
-# Stop running processes
+# -- Processes ------------------------------------------------------------
+
+# Stops the eds_app processes belonging to the installation being written.
+#
+# The application re-executes itself as a Gmsh worker and as a native-kernel
+# worker, so those share the executable's name. Each holds a handle on the file
+# about to be replaced, and one survivor is enough to fail the copy.
+#
+# Scoped by executable path, not by name. A developer running a build from a
+# source tree, or a second installation in another directory, is none of this
+# script's business -- killing those would be a surprising way to lose unsaved
+# work. A process whose path cannot be read is left alone for the same reason: it
+# has not been shown to belong to this installation, and if it does turn out to
+# hold a handle the copy fails loudly with EXIT_COPY_FAILED.
+function Get-InstalledProcesses {
+    $prefix = (Join-Path $InstallPath "").TrimEnd('\')
+    return @(Get-Process -Name "eds_app" -ErrorAction SilentlyContinue | Where-Object {
+        $path = $null
+        try { $path = $_.Path } catch { }
+        $path -and $path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+}
+
 function Stop-EnginuityProcesses {
     Write-Step "Stopping running processes..."
-    $processes = @("enginuity_launcher", "enginuity_local_server", "enginuity_design_studio")
-    
-    foreach ($proc in $processes) {
-        $running = Get-Process -Name $proc -ErrorAction SilentlyContinue
-        if ($running) {
-            Write-ColorOutput "  Stopping $proc..." "Gray"
-            Stop-Process -Name $proc -Force -ErrorAction SilentlyContinue
-        }
+
+    $running = Get-InstalledProcesses
+    if ($running.Count -eq 0) {
+        Write-Success "Nothing to stop"
+        return $true
     }
-    
+
+    Write-ColorOutput "  Stopping $($running.Count) process(es) from $InstallPath..." "Gray"
+    $running | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
+
+    $survivors = Get-InstalledProcesses
+    if ($survivors.Count -gt 0) {
+        Write-ErrorMsg "$($survivors.Count) process(es) would not stop."
+        return $false
+    }
+
     Write-Success "Processes stopped"
+    return $true
 }
 
-# Install/Update/Repair function
+# -- Package layout -------------------------------------------------------
+
+# Locates the payload root inside an extracted package.
+#
+# The ZIP normally contains one Enginuity_Deploy_... directory, but a package
+# zipped without its parent has the files at the root. Both are recognised by
+# looking for the executable rather than by trusting a name.
+function Find-PayloadRoot {
+    param([string]$ExtractPath)
+
+    if (Test-Path (Join-Path $ExtractPath $EXECUTABLE)) {
+        return $ExtractPath
+    }
+
+    foreach ($pattern in @("*Deploy*Windows*x64*", "*Deploy*Windows*x86*", "Enginuity_Deploy_*", "*")) {
+        $candidates = @(Get-ChildItem -Path $ExtractPath -Filter $pattern -Directory -ErrorAction SilentlyContinue)
+        foreach ($candidate in $candidates) {
+            if (Test-Path (Join-Path $candidate.FullName $EXECUTABLE)) {
+                return $candidate.FullName
+            }
+        }
+    }
+
+    return $null
+}
+
+# Verifies a payload carries everything the application loads at run time.
+#
+# A package missing runtime\ccx would install cleanly and fail at the user's
+# first solve, which is a far worse outcome than refusing to install.
+function Test-Payload {
+    param([string]$PayloadRoot)
+
+    foreach ($required in @($EXECUTABLE, "runtime\ccx", "runtime\gmsh")) {
+        if (-not (Test-Path (Join-Path $PayloadRoot $required))) {
+            Write-ErrorMsg "Package is incomplete: $required is missing."
+            return $false
+        }
+    }
+    return $true
+}
+
+# -- Install --------------------------------------------------------------
+
 function Install-Enginuity {
-    param(
-        [string]$Mode = "install"  # install, update, repair
-    )
-    
+    param([string]$Mode = "install")
+
     Show-Banner
-    
-    # Check if running as admin (warn but don't require)
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if ($isAdmin) {
-        Write-ColorOutput "`n⚠ Warning: Running as Administrator. Installation will proceed in user context." "Yellow"
+
+    if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-ColorOutput "`n  Running as Administrator. The installation stays in the user context." "Yellow"
     }
-    
-    # Validate installation path
-    Write-Step "Validating installation path..."
+
+    Write-Step "Validating the installation path..."
     if ($InstallPath -like "*Program Files*") {
-        Write-ErrorMsg "Cannot install in Program Files. Using default location."
-        $InstallPath = "$env:LOCALAPPDATA\Enginuity Labs\Enginuity Design Studio"
+        Write-ErrorMsg "Program Files is not a supported location; using the default instead."
+        $script:InstallPath = "$env:LOCALAPPDATA\Enginuity Labs\Enginuity Design Studio"
     }
-    Write-ColorOutput "Installation path: $InstallPath" "Gray"
-    
-    # Check for existing installation
-    if ((Test-Path $InstallPath) -and $Mode -eq "install") {
-        Write-ColorOutput "`n⚠ Existing installation found at: $InstallPath" "Yellow"
-        $response = Read-Host "Do you want to upgrade? (y/N)"
-        if ($response -ne 'y' -and $response -ne 'Y') {
-            Write-ColorOutput "Installation cancelled." "Yellow"
-            return
+    Write-ColorOutput "  Installation path: $InstallPath" "Gray"
+
+    if ((Test-Installation) -and $Mode -eq "install") {
+        Write-ColorOutput "`n  An existing installation was found ($(Get-InstalledVersion))." "Yellow"
+        $response = Read-Answer -Prompt "Upgrade it? (y/N)" -Default "y"
+        if ($response -notmatch '^[Yy]$') {
+            Write-ColorOutput "  Cancelled." "Yellow"
+            return $EXIT_OK
         }
         $Mode = "update"
     }
-    
-    # Stop processes if updating/repairing
-    if ($Mode -ne "install") {
-        Stop-EnginuityProcesses
+
+    if (-not (Wait-ForHandoff)) {
+        return $EXIT_PROCESS_STUCK
     }
-    
-    # Get release info
-    $releaseInfo = Get-ReleaseInfo -TargetVersion $Version
-    
-    # Create temporary directory
-    $tempDir = Join-Path $env:TEMP "enginuity_install_$(Get-Random)"
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    
+    if (-not (Stop-EnginuityProcesses)) {
+        return $EXIT_PROCESS_STUCK
+    }
+
     try {
-        # Download package
-        $zipPath = Join-Path $tempDir "enginuity_deploy.zip"
-        Get-FileWithProgress -Url $releaseInfo.DownloadUrl -Destination $zipPath -FileName $releaseInfo.FileName
-        
-        # Extract package
-        Write-Step "Extracting package..."
-        $extractPath = Join-Path $tempDir "extracted"
-        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-        
-        # Find the deploy directory (handles multiple naming conventions)
-        # Try Windows x86 specific first
-        $deployDir = Get-ChildItem -Path $extractPath -Filter "*Deploy*Windows*x86*" -Directory | Select-Object -First 1
-        
-        if (-not $deployDir) {
-            # Fallback to generic Deploy folder (backward compatibility)
-            $deployDir = Get-ChildItem -Path $extractPath -Filter "Enginuity_Deploy_*" -Directory | Select-Object -First 1
-        }
-        
-        if (-not $deployDir) {
-            # No folder found - files might be at root level
-            # Check if expected files exist at root
-            if ((Test-Path "$extractPath\enginuity_launcher.exe") -and 
-                (Test-Path "$extractPath\server") -and 
-                (Test-Path "$extractPath\enginuity_design_studio")) {
-                
-                Write-ColorOutput "  Using files from ZIP root..." "Gray"
-                # Create a pseudo deploy directory object
-                $deployDir = [PSCustomObject]@{
-                    FullName = $extractPath
-                }
-            } else {
-                throw "Deploy directory or required files not found in package. Expected structure:`n  - Enginuity_Deploy_Windows_x86_vX.X.X.X/ (folder), OR`n  - Enginuity_Deploy_vX.X.X.X/ (folder), OR`n  - enginuity_launcher.exe, server/, enginuity_design_studio/ at root"
-            }
-        }
-        
-        Write-Success "Package extracted"
-        
-        # Create installation directories
-        Write-Step "Creating installation directories..."
-        New-Item -ItemType Directory -Path $InstallPath -Force | Out-Null
-        New-Item -ItemType Directory -Path "$InstallPath\logs\launcher_logs" -Force | Out-Null
-        New-Item -ItemType Directory -Path "$InstallPath\logs\server_logs" -Force | Out-Null
-        New-Item -ItemType Directory -Path "$InstallPath\logs\app_logs" -Force | Out-Null
-        Write-Success "Directories created"
-        
-        # Copy files
-        Write-Step "Installing files..."
-        
-        # Launcher
-        Copy-Item -Path "$($deployDir.FullName)\enginuity_launcher.exe" -Destination $InstallPath -Force
-        
-        # Server
-        $serverPath = "$InstallPath\server"
-        New-Item -ItemType Directory -Path $serverPath -Force | Out-Null
-        Copy-Item -Path "$($deployDir.FullName)\server\enginuity_local_server.exe" -Destination $serverPath -Force
-        
-        # Flutter app
-        $appPath = "$InstallPath\enginuity_design_studio"
-        if (Test-Path $appPath) {
-            Remove-Item -Path $appPath -Recurse -Force
-        }
-        Copy-Item -Path "$($deployDir.FullName)\enginuity_design_studio" -Destination $InstallPath -Recurse -Force
-        
-        Write-Success "Files installed"
-        
-        # Create shortcuts
-        Write-Step "Creating shortcuts..."
-        
-        try {
-            $WshShell = New-Object -ComObject WScript.Shell
-            
-            # Start Menu
-            $startMenuPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\$PRODUCT_NAME"
-            New-Item -ItemType Directory -Path $startMenuPath -Force | Out-Null
-            
-            try {
-                $shortcut = $WshShell.CreateShortcut("$startMenuPath\$PRODUCT_NAME.lnk")
-                $shortcut.TargetPath = "$InstallPath\enginuity_launcher.exe"
-                $shortcut.WorkingDirectory = $InstallPath
-                $shortcut.Description = $PRODUCT_NAME
-                $shortcut.Save()
-                Write-ColorOutput "  Created Start Menu shortcut" "Gray"
-            } catch {
-                Write-ColorOutput "  Warning: Could not create Start Menu shortcut: $_" "Yellow"
-            }
-            
-            # Desktop shortcut
-            try {
-                $desktopPath = [Environment]::GetFolderPath("Desktop")
-                $shortcut = $WshShell.CreateShortcut("$desktopPath\$PRODUCT_NAME.lnk")
-                $shortcut.TargetPath = "$InstallPath\enginuity_launcher.exe"
-                $shortcut.WorkingDirectory = $InstallPath
-                $shortcut.Description = $PRODUCT_NAME
-                $shortcut.Save()
-                Write-ColorOutput "  Created Desktop shortcut" "Gray"
-            } catch {
-                Write-ColorOutput "  Warning: Could not create Desktop shortcut: $_" "Yellow"
-            }
-            
-            # Release COM object
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($WshShell) | Out-Null
-            
-            Write-Success "Shortcuts created"
-            
-        } catch {
-            Write-ColorOutput "⚠ Warning: Shortcut creation failed, but installation will continue." "Yellow"
-            Write-ColorOutput "  You can manually create shortcuts to: $InstallPath\enginuity_launcher.exe" "Gray"
-        }
-        
-        # Registry entries
-        Write-Step "Registering application..."
-        
-        $regPath = "HKCU:\Software\$COMPANY_NAME\$PRODUCT_NAME"
-        New-Item -Path $regPath -Force | Out-Null
-        Set-ItemProperty -Path $regPath -Name "InstallDir" -Value $InstallPath
-        Set-ItemProperty -Path $regPath -Name "Version" -Value $releaseInfo.Version
-        
-        # Uninstall registry
-        $uninstallPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EnginuityDesignStudio"
-        New-Item -Path $uninstallPath -Force | Out-Null
-        Set-ItemProperty -Path $uninstallPath -Name "DisplayName" -Value $PRODUCT_NAME
-        Set-ItemProperty -Path $uninstallPath -Name "DisplayVersion" -Value $releaseInfo.Version
-        Set-ItemProperty -Path $uninstallPath -Name "Publisher" -Value $COMPANY_NAME
-        Set-ItemProperty -Path $uninstallPath -Name "InstallLocation" -Value $InstallPath
-        Set-ItemProperty -Path $uninstallPath -Name "UninstallString" -Value "powershell -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/$GITHUB_REPO/main/install.ps1 | iex -Action uninstall`""
-        Set-ItemProperty -Path $uninstallPath -Name "DisplayIcon" -Value "$InstallPath\enginuity_launcher.exe,0"
-        
-        Write-Success "Application registered"
-        
-        # Create uninstaller script (kept for backward compatibility)
-        $uninstallScript = @"
-# Enginuity Design Studio Uninstaller
-# You can also run: irm https://raw.githubusercontent.com/$GITHUB_REPO/main/install.ps1 | iex -Action uninstall
-
-`$ErrorActionPreference = "Stop"
-
-Write-Host "Uninstalling $PRODUCT_NAME..." -ForegroundColor Cyan
-
-# Stop processes
-Get-Process -Name "enginuity_launcher","enginuity_local_server","enginuity_design_studio" -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 2
-
-# Remove files
-Remove-Item -Path "$InstallPath\enginuity_design_studio" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$InstallPath\server" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$InstallPath\enginuity_launcher.exe" -Force -ErrorAction SilentlyContinue
-
-`$response = Read-Host "Remove log files? (y/N)"
-if (`$response -eq 'y' -or `$response -eq 'Y') {
-    Remove-Item -Path "$InstallPath\logs" -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-# Remove shortcuts
-Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\$PRODUCT_NAME" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$env:USERPROFILE\Desktop\$PRODUCT_NAME.lnk" -Force -ErrorAction SilentlyContinue
-
-# Remove registry
-Remove-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EnginuityDesignStudio" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "HKCU:\Software\$COMPANY_NAME\$PRODUCT_NAME" -Recurse -Force -ErrorAction SilentlyContinue
-
-# Remove installation directory
-Remove-Item -Path "$InstallPath" -Recurse -Force -ErrorAction SilentlyContinue
-
-Write-Host "✓ Uninstallation completed!" -ForegroundColor Green
-"@
-        
-        Set-Content -Path "$InstallPath\uninstall.ps1" -Value $uninstallScript
-        
+        $releaseInfo = Get-ReleaseInfo -TargetVersion $Version
     } catch {
-        Write-ErrorMsg "Installation failed: $_"
-        Read-Host "`nPress Enter to continue"
-        return
+        Write-ErrorMsg "Could not read release information: $($_.Exception.Message)"
+        return $EXIT_NO_RELEASE
+    }
+
+    $tempDir = Join-Path $env:TEMP "enginuity_install_$([System.Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    try {
+        $zipPath = Join-Path $tempDir "package.zip"
+        try {
+            Get-FileWithProgress -Url $releaseInfo.DownloadUrl -Destination $zipPath -FileName $releaseInfo.FileName
+        } catch {
+            Write-ErrorMsg $_.Exception.Message
+            return $EXIT_DOWNLOAD_FAILED
+        }
+
+        Write-Step "Extracting the package..."
+        $extractPath = Join-Path $tempDir "extracted"
+        try {
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+        } catch {
+            Write-ErrorMsg "The package could not be extracted: $($_.Exception.Message)"
+            return $EXIT_BAD_PACKAGE
+        }
+
+        $payloadRoot = Find-PayloadRoot -ExtractPath $extractPath
+        if (-not $payloadRoot) {
+            Write-ErrorMsg "No $EXECUTABLE found in the package."
+            return $EXIT_BAD_PACKAGE
+        }
+        if (-not (Test-Payload -PayloadRoot $payloadRoot)) {
+            return $EXIT_BAD_PACKAGE
+        }
+        Write-Success "Package extracted"
+
+        Write-Step "Installing files..."
+        New-Item -ItemType Directory -Path $InstallPath -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $InstallPath "logs") -Force | Out-Null
+
+        # Mirrored rather than copied, so a library dropped from a later release
+        # actually goes away instead of lingering and being loaded. logs and
+        # update are excluded because /PURGE would otherwise delete the user's
+        # logs and the staged installer this script may be running from.
+        $robocopyArgs = @(
+            $payloadRoot, $InstallPath, "/E", "/PURGE",
+            "/XD", (Join-Path $InstallPath "logs"), (Join-Path $InstallPath "update"),
+            "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/NP", "/R:2", "/W:2"
+        )
+        & robocopy @robocopyArgs | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+            Write-ErrorMsg "Copying files failed (robocopy exit code $LASTEXITCODE)."
+            return $EXIT_COPY_FAILED
+        }
+        if (-not (Test-Path (Join-Path $InstallPath $EXECUTABLE))) {
+            Write-ErrorMsg "$EXECUTABLE is not present after the copy."
+            return $EXIT_COPY_FAILED
+        }
+        Write-Success "Files installed"
+
+        New-Shortcuts
+        Register-Application -ReleaseVersion $releaseInfo.Version
+        New-InstallMarker -Tag $releaseInfo.Version
+    } catch {
+        Write-ErrorMsg "Installation failed: $($_.Exception.Message)"
+        return $EXIT_GENERAL
     } finally {
-        # Cleanup
         Write-Step "Cleaning up..."
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Success "Cleanup completed"
+        Write-Success "Done"
     }
-    
-    # Success message
+
     $modeText = switch ($Mode) {
         "install" { "Installation" }
-        "update" { "Update" }
-        "repair" { "Repair" }
+        "update"  { "Update" }
+        "repair"  { "Repair" }
+        default   { "Installation" }
     }
-    
+
     Write-ColorOutput @"
 
-╔═══════════════════════════════════════════════════╗
-║                                                   ║
-║     ✓ $modeText Completed Successfully!           ║
-║                                                   ║
-╚═══════════════════════════════════════════════════╝
++===================================================+
+|                                                   |
+|   $modeText completed successfully.
+|                                                   |
++===================================================+
 
 "@ "Green"
-    
-    Write-ColorOutput "Installed to: $InstallPath" "Gray"
-    Write-ColorOutput "Version: $($releaseInfo.Version)" "Gray"
-    
-    $response = Read-Host "`nLaunch $PRODUCT_NAME now? (Y/n)"
-    if ($response -ne 'n' -and $response -ne 'N') {
-        Start-Process "$InstallPath\enginuity_launcher.exe"
+
+    Write-ColorOutput "  Installed to: $InstallPath" "Gray"
+    Write-ColorOutput "  Version:      $($releaseInfo.Version)" "Gray"
+
+    # -NoLaunch always wins, so a caller can be explicit without knowing whether
+    # something else already asked for a launch.
+    $shouldLaunch = if ($NoLaunch) { $false }
+                    elseif ($Launch) { $true }
+                    elseif ($Silent) { $false }
+                    else { (Read-Answer -Prompt "Launch $PRODUCT_NAME now? (Y/n)" -Default "y") -notmatch '^[Nn]$' }
+    if ($shouldLaunch) {
+        Write-Step "Starting $PRODUCT_NAME..."
+        Start-Process -FilePath (Join-Path $InstallPath $EXECUTABLE) -WorkingDirectory $InstallPath
+    }
+
+    return $EXIT_OK
+}
+
+function New-Shortcuts {
+    Write-Step "Creating shortcuts..."
+
+    $target = Join-Path $InstallPath $EXECUTABLE
+    $shell = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+
+        $startMenuPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\$PRODUCT_NAME"
+        New-Item -ItemType Directory -Path $startMenuPath -Force | Out-Null
+        foreach ($location in @((Join-Path $startMenuPath "$PRODUCT_NAME.lnk"),
+                                (Join-Path ([Environment]::GetFolderPath("Desktop")) "$PRODUCT_NAME.lnk"))) {
+            try {
+                $shortcut = $shell.CreateShortcut($location)
+                $shortcut.TargetPath = $target
+                $shortcut.WorkingDirectory = $InstallPath
+                $shortcut.Description = $PRODUCT_NAME
+                $shortcut.Save()
+            } catch {
+                Write-ColorOutput "  Could not create $location : $($_.Exception.Message)" "Yellow"
+            }
+        }
+        Write-Success "Shortcuts created"
+    } catch {
+        # A missing shortcut is cosmetic; the installation is still usable.
+        Write-ColorOutput "  Shortcut creation failed. Start the application from $target" "Yellow"
+    } finally {
+        if ($shell) {
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
+        }
     }
 }
 
-# Uninstall function
+function Register-Application {
+    param([string]$ReleaseVersion)
+
+    Write-Step "Registering the application..."
+
+    $target = Join-Path $InstallPath $EXECUTABLE
+
+    # Built as a scriptblock rather than as `irm ... | iex -Action uninstall`.
+    # Invoke-Expression has no -Action parameter, so the piped form silently
+    # discards it and runs the interactive menu instead of uninstalling --
+    # which is what Add/Remove Programs would have invoked.
+    $rawUrl = "https://raw.githubusercontent.com/$GITHUB_REPO/main/install.ps1"
+    $uninstallCommand = "powershell -NoProfile -ExecutionPolicy Bypass -Command " +
+        "`"& ([scriptblock]::Create((irm $rawUrl))) -Action uninstall`""
+
+    $regPath = "HKCU:\Software\$COMPANY_NAME\$PRODUCT_NAME"
+    New-Item -Path $regPath -Force | Out-Null
+    Set-ItemProperty -Path $regPath -Name "InstallDir" -Value $InstallPath
+    Set-ItemProperty -Path $regPath -Name "Version" -Value $ReleaseVersion
+
+    $uninstallPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EnginuityDesignStudio"
+    New-Item -Path $uninstallPath -Force | Out-Null
+    Set-ItemProperty -Path $uninstallPath -Name "DisplayName" -Value $PRODUCT_NAME
+    Set-ItemProperty -Path $uninstallPath -Name "DisplayVersion" -Value $ReleaseVersion
+    Set-ItemProperty -Path $uninstallPath -Name "Publisher" -Value $COMPANY_NAME
+    Set-ItemProperty -Path $uninstallPath -Name "InstallLocation" -Value $InstallPath
+    Set-ItemProperty -Path $uninstallPath -Name "UninstallString" -Value $uninstallCommand
+    Set-ItemProperty -Path $uninstallPath -Name "DisplayIcon" -Value "$target,0"
+
+    Write-Success "Application registered"
+}
+
+# Writes install.json beside the executable.
+#
+# This marker is what tells the application it is a managed installation and
+# where that installation lives. Without it the updater stays inert, which is the
+# right answer for a package somebody unzipped by hand: there is nothing known to
+# replace, and no installer to replace it with.
+#
+# Written without a byte-order mark. Set-Content -Encoding UTF8 emits one under
+# Windows PowerShell 5.1, and serde_json refuses a leading BOM -- the marker
+# would parse in PowerShell, look correct to a human, and be invisible to the
+# application that needs it.
+function New-InstallMarker {
+    param([string]$Tag)
+
+    Write-Step "Recording the installation marker..."
+
+    # Prefer the version the package shipped with over one derived from the tag:
+    # it is what deploy.ps1 stamped into the executable, so the marker and the
+    # binary agree even if a tag were ever named inconsistently.
+    $version = $Tag.TrimStart('v', 'V')
+    $versionPath = Join-Path $InstallPath "VERSION.txt"
+    if (Test-Path $versionPath) {
+        try {
+            $fromPackage = (Get-Content $versionPath -Raw).Trim()
+            if ($fromPackage) { $version = $fromPackage }
+        } catch { }
+    }
+
+    $marker = [ordered]@{
+        schema       = 1
+        version      = $version
+        tag          = $Tag
+        installPath  = $InstallPath
+        installedUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        repo         = $GITHUB_REPO
+    }
+
+    $markerPath = Join-Path $InstallPath "install.json"
+    $json = $marker | ConvertTo-Json
+    [System.IO.File]::WriteAllText($markerPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Success "Marked as version $version"
+}
+
+# -- Uninstall ------------------------------------------------------------
+
 function Uninstall-Enginuity {
     Show-Banner
-    
+
     if (-not (Test-Path $InstallPath)) {
-        Write-ColorOutput "`n⚠ Enginuity Design Studio is not installed." "Yellow"
-        Read-Host "`nPress Enter to continue"
-        return
+        Write-ColorOutput "`n  $PRODUCT_NAME is not installed." "Yellow"
+        return $EXIT_OK
     }
-    
-    Write-ColorOutput "`n⚠ WARNING: This will remove Enginuity Design Studio from your system." "Yellow"
-    Write-ColorOutput "Installation path: $InstallPath`n" "Gray"
-    
-    $confirm = Read-Host "Are you sure you want to uninstall? (yes/no)"
-    if ($confirm -ne "yes") {
-        Write-ColorOutput "`nUninstallation cancelled." "Yellow"
-        return
+
+    Write-ColorOutput "`n  This removes $PRODUCT_NAME from this machine." "Yellow"
+    Write-ColorOutput "  Installation path: $InstallPath`n" "Gray"
+
+    if ((Read-Answer -Prompt "Type 'yes' to confirm" -Default "no") -ne "yes") {
+        Write-ColorOutput "`n  Cancelled." "Yellow"
+        return $EXIT_OK
     }
-    
+
     try {
-        # Stop processes
-        Stop-EnginuityProcesses
-        
-        # Remove files
-        Write-Step "Removing application files..."
-        Remove-Item -Path "$InstallPath\enginuity_design_studio" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "$InstallPath\server" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "$InstallPath\enginuity_launcher.exe" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "$InstallPath\uninstall.ps1" -Force -ErrorAction SilentlyContinue
-        
-        # Ask about logs
-        $response = Read-Host "`nRemove log files? (y/N)"
-        if ($response -eq 'y' -or $response -eq 'Y') {
-            Remove-Item -Path "$InstallPath\logs" -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Stop-EnginuityProcesses)) {
+            return $EXIT_PROCESS_STUCK
         }
-        
+
+        Write-Step "Removing application files..."
+        foreach ($item in @("runtime", $EXECUTABLE, "VERSION.txt", "README.txt", "install.json", "uninstall.ps1")) {
+            Remove-Item -Path (Join-Path $InstallPath $item) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -Path (Join-Path $InstallPath "update") -Recurse -Force -ErrorAction SilentlyContinue
+
+        if ((Read-Answer -Prompt "Remove log files as well? (y/N)" -Default "n") -match '^[Yy]$') {
+            Remove-Item -Path (Join-Path $InstallPath "logs") -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Write-Success "Files removed"
-        
-        # Remove shortcuts
+
         Write-Step "Removing shortcuts..."
         Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\$PRODUCT_NAME" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        $desktopPath = [Environment]::GetFolderPath("Desktop")
-        Remove-Item -Path "$desktopPath\$PRODUCT_NAME.lnk" -Force -ErrorAction SilentlyContinue
-        
+        Remove-Item -Path (Join-Path ([Environment]::GetFolderPath("Desktop")) "$PRODUCT_NAME.lnk") -Force -ErrorAction SilentlyContinue
         Write-Success "Shortcuts removed"
-        
-        # Remove registry
+
         Write-Step "Removing registry entries..."
         Remove-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EnginuityDesignStudio" -Force -ErrorAction SilentlyContinue
         Remove-Item -Path "HKCU:\Software\$COMPANY_NAME\$PRODUCT_NAME" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "HKCU:\Software\$COMPANY_NAME" -Force -ErrorAction SilentlyContinue
         Write-Success "Registry cleaned"
-        
-        # Remove installation directory
-        Remove-Item -Path "$InstallPath" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        Write-ColorOutput @"
 
-╔═══════════════════════════════════════════════════╗
-║                                                   ║
-║     ✓ Uninstallation Completed Successfully!      ║
-║                                                   ║
-╚═══════════════════════════════════════════════════╝
-
-"@ "Green"
-        
-        Write-ColorOutput "Thank you for using Enginuity Design Studio!" "Cyan"
-        
+        # Only if the user did not keep their logs, so a directory that still
+        # holds something is never removed from under them.
+        Remove-Item -Path $InstallPath -Recurse -Force -ErrorAction SilentlyContinue
     } catch {
-        Write-ErrorMsg "Uninstallation failed: $_"
-        Read-Host "`nPress Enter to continue"
-        return
+        Write-ErrorMsg "Uninstallation failed: $($_.Exception.Message)"
+        return $EXIT_GENERAL
     }
-    
-    Read-Host "`nPress Enter to continue"
+
+    Write-ColorOutput "`n  $PRODUCT_NAME has been removed.`n" "Green"
+    return $EXIT_OK
 }
 
-# Main execution
+# -- Entry point ----------------------------------------------------------
+
+# A silent run has nobody watching the console, and the console closes with the
+# process. Without a transcript, "the update didn't work" carries no evidence at
+# all; with one it is a file the user can attach to a report. Alongside the
+# application's own data, so support asks for one directory rather than two.
+$transcriptStarted = $false
+if ($Silent) {
+    try {
+        $logDirectory = Join-Path $env:LOCALAPPDATA "Enginuity Labs\Design Studio\update"
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+        $safeTag = ($Version -replace '[^A-Za-z0-9._-]', '_')
+        Start-Transcript -Path (Join-Path $logDirectory "install-$safeTag.log") -Force | Out-Null
+        $transcriptStarted = $true
+    } catch {
+        # Losing the log must not lose the update.
+    }
+}
+
+$exitCode = $EXIT_GENERAL
 try {
-    # If action is specified via parameter, skip menu
-    if ($Action -ne "menu") {
-        switch ($Action) {
-            "install" { Install-Enginuity -Mode "install" }
-            "update" { Install-Enginuity -Mode "update" }
-            "repair" { Install-Enginuity -Mode "repair" }
-            "uninstall" { Uninstall-Enginuity }
-        }
-    } else {
-        # Show menu
-        $isInstalled = Test-Installation
-        $selectedAction = Show-Menu -IsInstalled $isInstalled
-        
-        switch ($selectedAction) {
-            "install" { Install-Enginuity -Mode "install" }
-            "update" { Install-Enginuity -Mode "update" }
-            "repair" { Install-Enginuity -Mode "repair" }
-            "uninstall" { Uninstall-Enginuity }
-            "exit" { 
-                Write-ColorOutput "`nGoodbye!" "Cyan"
-                return
-            }
-        }
+    $selected = $Action
+    if ($selected -eq "menu") {
+        $selected = Show-Menu -IsInstalled (Test-Installation)
+    }
+
+    switch ($selected) {
+        "install"   { $exitCode = Install-Enginuity -Mode "install" }
+        "update"    { $exitCode = Install-Enginuity -Mode "update" }
+        "repair"    { $exitCode = Install-Enginuity -Mode "repair" }
+        "uninstall" { $exitCode = Uninstall-Enginuity }
+        "exit"      { Write-ColorOutput "`n  Goodbye.`n" "Cyan"; $exitCode = $EXIT_OK }
+        default     { $exitCode = $EXIT_OK }
     }
 } catch {
-    Write-ErrorMsg "`nAn unexpected error occurred: $_"
-    Read-Host "`nPress Enter to continue"
+    Write-ErrorMsg "`nAn unexpected error occurred: $($_.Exception.Message)"
+    $exitCode = $EXIT_GENERAL
 }
+
+if ($transcriptStarted) {
+    try { Stop-Transcript | Out-Null } catch { }
+}
+
+# An interactive run that reported a failure would otherwise close its window
+# before the reason could be read.
+if (-not $Silent -and $exitCode -ne $EXIT_OK) {
+    Read-Host "`n  Press Enter to close" | Out-Null
+}
+
+exit $exitCode
