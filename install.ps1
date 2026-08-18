@@ -537,12 +537,17 @@ function Install-Enginuity {
         New-Item -ItemType Directory -Path $InstallPath -Force | Out-Null
 
         # Mirrored rather than copied, so a library dropped from a later release
-        # actually goes away instead of lingering and being loaded. logs and
-        # update are excluded because /PURGE would otherwise delete the user's
-        # logs and the staged installer this script may be running from.
+        # actually goes away instead of lingering and being loaded.
+        #
+        # data and cache hold the user's half of this directory -- preferences,
+        # sign-in, logs, staged installers, cached conversations -- and the
+        # payload contains neither, so /PURGE would delete every one of them on
+        # each update. These two exclusions are the only thing standing between an
+        # update and the user's saved state; the application's data directories
+        # are named in eds_core::config, and this list has to keep matching them.
         $robocopyArgs = @(
             $payloadRoot, $InstallPath, "/E", "/PURGE",
-            "/XD", (Join-Path $InstallPath "logs"), (Join-Path $InstallPath "update"),
+            "/XD", (Join-Path $InstallPath "data"), (Join-Path $InstallPath "cache"),
             "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/NP", "/R:2", "/W:2"
         )
         & robocopy @robocopyArgs | Out-Null
@@ -778,10 +783,13 @@ function Uninstall-Enginuity {
         Remove-UserData
 
         Write-Step "Removing application files..."
-        foreach ($item in @("runtime", $EXECUTABLE, "VERSION.txt", "README.txt", "install.json", "uninstall.ps1")) {
+        # data and cache belong to the user and were already removed by
+        # Remove-UserData above; they are named here so that an installation whose
+        # purge failed is still cleaned up rather than half-removed.
+        foreach ($item in @("runtime", "data", "cache", $EXECUTABLE,
+                            "VERSION.txt", "README.txt", "install.json", "uninstall.ps1")) {
             Remove-Item -Path (Join-Path $InstallPath $item) -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item -Path (Join-Path $InstallPath "update") -Recurse -Force -ErrorAction SilentlyContinue
 
         Write-Success "Files removed"
 
