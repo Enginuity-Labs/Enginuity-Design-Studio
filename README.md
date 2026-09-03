@@ -17,36 +17,11 @@ That's it! The installer will:
 - ✅ Create desktop & start menu shortcuts
 - ✅ Register the application in Windows
 
-## 📦 What Gets Installed
-
-```
-%LOCALAPPDATA%\Enginuity Labs\Enginuity Design Studio\
-  eds_app.exe               the application
-  runtime\ccx\              CalculiX solver and its runtime libraries
-  runtime\gmsh\             Gmsh meshing library
-  VERSION.txt               the installed release version
-  install.json              installation marker, read by the in-app updater
-
-  data\                     your data -- kept across updates, removed on uninstall
-    preferences.enc         profile and recent workspaces
-    logs\eds_app.log       application log
-    update\                staged installers and their transcripts
-  cache\                    rebuildable caches
-```
-
-Everything lives under one folder. Updating replaces the application and leaves
-`data` and `cache` untouched; uninstalling removes all of it.
-
-Meshing and simulation run **locally** against the bundled Gmsh and CalculiX. The
-download is roughly 85 MB and the installation about 250 MB on disk.
-
 ## 📋 Features
 
 - 🤖 **AI-Powered CAD** - Intelligent design automation
 - 🔌 **AI-Powered PCB Design** - Integrated circuit board layout
 - 📊 **AI-Powered Simulations** - Real-time design validation
-- 🔗 **Integrations** - Onshape, Upcoming(_Solidworks, KiCad, Altium, Ansys_)
-- 💾 **Cloud Sync** - Work from anywhere
 
 ## 💻 System Requirements
 
@@ -141,17 +116,6 @@ run writes a transcript to
    `%LOCALAPPDATA%\Enginuity Labs\Enginuity Design Studio\data\logs\eds_app.log`,
    and for a silent run the installer transcript beside it under `...\data\update\`
 5. Check [Issues](https://github.com/Enginuity-Labs/Enginuity-Design-Studio/issues)
-
-### The In-App Updater Never Offers Anything
-It stays inactive on purpose when the application is not a managed installation —
-if `install.json` is missing beside `eds_app.exe`, because the package was
-unzipped by hand rather than installed. Run the installer above to convert it into
-a managed installation.
-
-To switch the updater off for a session, set `EDS_UPDATER=off` before launching.
-
-### Can't Find Installed Files
-Check: `$env:LOCALAPPDATA\Enginuity Labs\Enginuity Design Studio`
 
 ## 📖 Documentation
 
